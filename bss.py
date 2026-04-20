@@ -79,7 +79,7 @@ def twoDsmooth(mat, ker):
         len(ker)
         kmat = ker
 
-    except:
+    except TypeError:
         kmat = np.ones((ker, ker)) / ker**2
 
     kr, kc = kmat.shape
@@ -213,7 +213,7 @@ class Duet(object):
 
         # Find the location of peaks in the attenuation-delay plane
         self.sym_atn_peak, self.delay_peak = self._find_n_peaks(
-            self.norm_atn_delay_hist, n_peaks=self.n_sources, width=0.5, prominence=5.0
+            self.norm_atn_delay_hist, n_peaks=self.n_sources, width=0.1, threshold=0.01, prominence=None
         )
 
         # Assign each time-frequency frame to the nearest peak in phase/amplitude
@@ -241,9 +241,13 @@ class Duet(object):
         fmat : ndarray
             Frequency matrix, the ndarray must have the following format (t, f).
         """
-        # Dividing by maximum to normalise
-        self.x1 = self.x[mic_pair[0]] / np.iinfo(np.int16).max
-        self.x2 = self.x[mic_pair[1]] / np.iinfo(np.int16).max
+        # Preserve float-valued traces as-is; only scale integer inputs.
+        self.x1 = self.x[mic_pair[0]]
+        self.x2 = self.x[mic_pair[1]]
+        if np.issubdtype(self.x1.dtype, np.integer):
+            self.x1 = self.x1 / np.iinfo(np.int16).max
+        if np.issubdtype(self.x2.dtype, np.integer):
+            self.x2 = self.x2 / np.iinfo(np.int16).max
 
         # time-freq domain
         _, _, tf1 = sp.signal.stft(self.x1, fs=self.fs, window=self._awin, nperseg=self._win_length, return_onesided=False)
@@ -337,8 +341,8 @@ class Duet(object):
         tf_weight = tf_weight[amask]
 
         # determine histogram indices
-        alphaind = np.around((self.n_attenuation_bins-1)*(alpha_vec+self.attenuation_max)/(2*self.attenuation_max))
-        deltaind = np.around((self.n_delay_bins-1)*(delta_vec+self.delay_max)/(2*self.delay_max))
+        alphaind = np.around((self.n_attenuation_bins-1)*(alpha_vec+self.attenuation_max)/(2*self.attenuation_max)).astype(int)
+        deltaind = np.around((self.n_delay_bins-1)*(delta_vec+self.delay_max)/(2*self.delay_max)).astype(int)
 
         # FULL-SPARSE TRICK TO CREATE 2D WEIGHTED HISTOGRAM
         # A(alphaind(k),deltaind(k)) = tf_weight(k), S is abins-by-dbins
@@ -352,7 +356,7 @@ class Duet(object):
         return A, tf_weight
 
     def _find_n_peaks(
-        self, norm_atn_delay_hist, n_peaks=None, width=None, threshold=0.2, prominence=None
+        self, norm_atn_delay_hist, n_peaks=None, width=None, threshold=0.01, prominence=None
     ):
         """
         Find the n largest peaks in the 2D histogram.
@@ -395,6 +399,15 @@ class Duet(object):
                 find_peak_indices(norm_atn_delay_hist, n_peaks=n_peaks, min_dist=1, threshold=threshold)
             )
 
+            if len(peaks) == 0:
+                print(f"Warning: No peaks found with threshold={threshold}. Using default peaks.")
+                # Fallback: find n_peaks largest values directly
+                flat_idx = np.argsort(norm_atn_delay_hist.flatten())[::-1][:n_peaks]
+                peaks = np.column_stack(np.unravel_index(flat_idx, norm_atn_delay_hist.shape))
+
+            if len(peaks) == 0:
+                raise RuntimeError("DUET peak search failed to find any histogram maxima.")
+            
             cand_peaks = norm_atn_delay_hist[peaks[:, 0], peaks[:, 1]]
             if n_peaks is None:
                 std = np.sqrt((np.abs(cand_peaks - cand_peaks[0])**2).mean())
@@ -407,11 +420,35 @@ class Duet(object):
             # https://stackoverflow.com/questions/1713335/peak-finding-algorithm-for-python-scipy
             delay_side = np.max(norm_atn_delay_hist, axis=0)
 
+            # Make prominence relative to the histogram scale when the provided
+            # value is too aggressive for the current data.
+            adaptive_prominence = prominence
+            max_delay_side = float(np.max(delay_side))
+            if not np.isfinite(adaptive_prominence) or adaptive_prominence <= 0:
+                adaptive_prominence = max_delay_side * 0.05
+            elif adaptive_prominence > max_delay_side:
+                adaptive_prominence = max_delay_side * 0.05
+            if adaptive_prominence <= 0:
+                adaptive_prominence = 1e-12
+
             dmax_idx, prop = find_peaks(
                 delay_side,
                 width=width,
-                prominence=prominence,
+                prominence=adaptive_prominence,
             )
+
+            if len(dmax_idx) == 0:
+                print(
+                    f"Warning: No peaks found with prominence={adaptive_prominence}. "
+                    "Falling back to direct maxima."
+                )
+                flat_idx = np.argsort(norm_atn_delay_hist.flatten())[::-1][:n_peaks]
+                peaks = np.column_stack(np.unravel_index(flat_idx, norm_atn_delay_hist.shape))
+                amax_idx = peaks[:, 0]
+                dmax_idx = peaks[:, 1]
+                atn_peak = y[amax_idx]
+                delay_peak = x[dmax_idx]
+                return atn_peak, delay_peak
 
             prom_rank = np.argsort(prop['prominences'])[::-1][:n_peaks]
             dmax_idx = dmax_idx[prom_rank]
@@ -444,6 +481,10 @@ class Duet(object):
             An array contains the each source which is a mask.
             The ndarray must have the following format (n_peaks, t, f)
         """
+        if len(sym_atn_peak) == 0:
+            print("Warning: sym_atn_peak is empty. Returning empty arrays.")
+            return sym_atn_peak, np.zeros(self.tf1.shape)
+        
         # convert the symmetric attenuation back to attenuation
         peaka = (sym_atn_peak + np.sqrt(np.square(sym_atn_peak) + 4)) / 2
         bestsofar = float("inf") * np.ones(self.tf1.shape)
